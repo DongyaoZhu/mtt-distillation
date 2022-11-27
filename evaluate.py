@@ -21,6 +21,7 @@ def plot_gap(acc, probs, bins, epoch):
         edgecolor='r',
         alpha=0.5,
         align='edge',
+        label='probs',
         tick_label=['%.1f'%b for b in bins]
     )
     plt.bar(
@@ -31,6 +32,7 @@ def plot_gap(acc, probs, bins, epoch):
         edgecolor='b',
         alpha=0.8,
         align='edge',
+        label='acc',
         tick_label=['%.1f'%b for b in bins]
     )
     plt.xlabel('confidence')
