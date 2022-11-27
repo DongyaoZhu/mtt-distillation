@@ -284,7 +284,7 @@ def get_network(model, channel, num_classes, im_size=(32, 32), dist=True):
         if gpu_num>0:
             device = 'cuda'
             if gpu_num>1:
-                net = nn.DataParallel(net, device_ids=[5,6])
+                net = nn.DataParallel(net)
         else:
             device = 'cpu'
         net = net.to(device)
@@ -348,8 +348,9 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False)
     return loss_avg, acc_avg
 
 
+from evaluate import calc_ece
 
-def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, return_loss=False, texture=False):
+def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, return_loss=False, texture=False, dst_train=None):
     net = net.to(args.device)
     images_train = images_train.to(args.device)
     labels_train = labels_train.to(args.device)
@@ -360,7 +361,8 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, 
 
     criterion = nn.CrossEntropyLoss().to(args.device)
 
-    dst_train = TensorDataset(images_train, labels_train)
+    if dst_train is None:
+        dst_train = TensorDataset(images_train, labels_train)
     trainloader = torch.utils.data.DataLoader(dst_train, batch_size=args.batch_train, shuffle=True, num_workers=0)
 
     start = time.time()
@@ -383,10 +385,20 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, 
 
     print('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f' % (get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test))
 
+    ece = calc_ece(
+        net,
+        testloader,
+        global_step=0,
+        epoch=it_eval,
+        device=args.device,
+        is_test_set=True,
+        is_train_set=False,
+    )
+
     if return_loss:
-        return net, acc_train_list, acc_test, loss_train_list, loss_test
+        return net, acc_train_list, acc_test, loss_train_list, loss_test, ece
     else:
-        return net, acc_train_list, acc_test
+        return net, acc_train_list, acc_test, ece
 
 
 def augment(images, dc_aug_param, device):

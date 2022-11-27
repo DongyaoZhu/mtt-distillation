@@ -184,9 +184,19 @@ def main(args):
 
     best_std = {m: 0 for m in model_eval_pool}
 
+    T = len(dst_train)
+    indices = np.arange(T)
+    np.random.shuffle(indices)
+    T = num_classes * args.ipc
+    dst_train, dst_valid = [dst_train[d] for d in indices[: T]], [
+        dst_train[d] for d in indices[T:]]
+    valid_loader = torch.utils.data.DataLoader(
+        dst_valid, batch_size=args.batch_train, shuffle=True, num_workers=0)
+
+
     x = torch.load('images_best_%s_%s%s.pt' % (args.dataset.lower(), args.ipc, '_z' if args.zca else ''))
     y = torch.load('labels_best_%s_%s%s.pt' % (args.dataset.lower(), args.ipc, '_z' if args.zca else ''))
-
+    print('load:', x.shape, num_classes * args.ipc)
     for it in range(0, args.Iteration+1):
         save_this_it = False
 
@@ -204,6 +214,7 @@ def main(args):
 
                 accs_test = []
                 accs_train = []
+                eces = []
                 for it_eval in range(args.num_eval):
                     net_eval = get_network(model_eval, channel, num_classes, im_size).to(args.device) # get a random model
 
@@ -216,7 +227,9 @@ def main(args):
                     label_syn_eval.data = copy.deepcopy(y)
 
                     args.lr_net = syn_lr.item()
-                    _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture)
+                    FD = False
+                    _, acc_train, acc_test, ece = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train if FD else None)
+                    eces.append(ece)
                     accs_test.append(acc_test)
                     accs_train.append(acc_train)
                 accs_test = np.array(accs_test)
@@ -232,6 +245,21 @@ def main(args):
                 wandb.log({'Max_Accuracy/{}'.format(model_eval): best_acc[model_eval]}, step=it)
                 wandb.log({'Std/{}'.format(model_eval): acc_test_std}, step=it)
                 wandb.log({'Max_Std/{}'.format(model_eval): best_std[model_eval]}, step=it)
+                print('avg ece: %.4f' % np.mean(eces))
+                from temperature import ModelWithTemperature
+                from evaluate import calc_ece
+                model = ModelWithTemperature(net_eval)
+                model.set_temperature(valid_loader)
+
+                ece = calc_ece(
+                    model,
+                    testloader,
+                    global_step=0,
+                    epoch=it_eval+1,
+                    device=args.device,
+                    is_test_set=True,
+                    is_train_set=False,
+                )                
         exit()
 
         if it in eval_it_pool and (save_this_it or it % 1000 == 0):
