@@ -14,7 +14,8 @@ class ModelWithTemperature(nn.Module):
     def __init__(self, model):
         super(ModelWithTemperature, self).__init__()
         self.model = model
-        self.temperature = nn.Parameter(torch.ones(1) * 1.5)
+        self.init = 1.5
+        self.temperature = nn.Parameter(torch.ones(1) * self.init)
 
     def forward(self, input):
         logits = self.model(input)
@@ -29,12 +30,13 @@ class ModelWithTemperature(nn.Module):
         return logits / temperature
 
     # This function probably should live outside of this class, but whatever
-    def set_temperature(self, valid_loader):
+    def set_temperature(self, valid_loader, threshold=None, mute=False):
         """
         Tune the tempearature of the model (using the validation set).
         We're going to set it to optimize NLL.
         valid_loader (DataLoader): validation set loader
         """
+        self.temperature = nn.Parameter(torch.ones(1) * self.init)
         self.cuda()
         nll_criterion = nn.CrossEntropyLoss().cuda()
         ece_criterion = _ECELoss().cuda()
@@ -45,6 +47,10 @@ class ModelWithTemperature(nn.Module):
         with torch.no_grad():
             for input, label in valid_loader:
                 input = input.cuda()
+                if threshold is not None:
+                    mask = (torch.rand_like(input) > threshold).float()
+                    input *= mask
+                # input = (torch.rand_like(input)).float()
                 logits = self.model(input)
                 logits_list.append(logits)
                 labels_list.append(label)
@@ -52,12 +58,13 @@ class ModelWithTemperature(nn.Module):
             labels = torch.cat(labels_list).cuda()
 
         # Calculate NLL and ECE before temperature scaling
-        before_temperature_nll = nll_criterion(logits, labels).item()
-        before_temperature_ece = ece_criterion(logits, labels).item()
-        print('Before temperature - NLL: %.3f, ECE: %.3f' % (before_temperature_nll, before_temperature_ece))
+        if not mute:
+            before_temperature_nll = nll_criterion(logits, labels).item()
+            before_temperature_ece = ece_criterion(logits, labels).item()
+            print('Before temperature - NLL: %.3f, ECE: %.3f' % (before_temperature_nll, before_temperature_ece))
 
         # Next: optimize the temperature w.r.t. NLL
-        optimizer = optim.LBFGS([self.temperature], lr=0.01, max_iter=50)
+        optimizer = optim.LBFGS([self.temperature], lr=1e-2, max_iter=50)
 
         def eval():
             optimizer.zero_grad()
@@ -67,10 +74,11 @@ class ModelWithTemperature(nn.Module):
         optimizer.step(eval)
 
         # Calculate NLL and ECE after temperature scaling
-        after_temperature_nll = nll_criterion(self.temperature_scale(logits), labels).item()
-        after_temperature_ece = ece_criterion(self.temperature_scale(logits), labels).item()
-        print('Optimal temperature: %.3f' % self.temperature.item())
-        print('After temperature - NLL: %.3f, ECE: %.3f' % (after_temperature_nll, after_temperature_ece))
+        if not mute:
+            after_temperature_nll = nll_criterion(self.temperature_scale(logits), labels).item()
+            after_temperature_ece = ece_criterion(self.temperature_scale(logits), labels).item()
+            print('Optimal temperature: %.3f' % self.temperature.item())
+            print('After temperature - NLL: %.3f, ECE: %.3f' % (after_temperature_nll, after_temperature_ece))
 
         return self
 
@@ -89,7 +97,7 @@ class _ECELoss(nn.Module):
     "Obtaining Well Calibrated Probabilities Using Bayesian Binning." AAAI.
     2015.
     """
-    def __init__(self, n_bins=15):
+    def __init__(self, n_bins=10):
         """
         n_bins (int): number of confidence interval bins
         """

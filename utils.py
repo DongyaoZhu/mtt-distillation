@@ -192,7 +192,8 @@ def get_default_convnet_setting():
 
 
 def get_network(model, channel, num_classes, im_size=(32, 32), dist=True):
-    torch.random.manual_seed(int(time.time() * 1000) % 100000)
+    # torch.random.manual_seed(int(time.time() * 1000) % 100000)
+    torch.manual_seed(0)
     net_width, net_depth, net_act, net_norm, net_pooling = get_default_convnet_setting()
 
     if model == 'MLP':
@@ -297,7 +298,13 @@ def get_time():
     return str(time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime()))
 
 
-def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False):
+from mixup import mixup_data, mixup_criterion
+from label_smooth import LabelSmoothingCrossEntropy
+from evaluate import calc_ece
+
+from torch.utils.tensorboard import SummaryWriter
+
+def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False, losstype='loss', log=None):
     loss_avg, acc_avg, num_exp = 0, 0, 0
     net = net.to(args.device)
 
@@ -309,9 +316,14 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False)
     else:
         net.eval()
 
+    if mode == 'train':
+        writer = log['writer']
+
     for i_batch, datum in enumerate(dataloader):
         img = datum[0].float().to(args.device)
         lab = datum[1].long().to(args.device)
+        if losstype == 'mixup':
+            img, ya, yb, n = mixup_data(img, lab, 1., True)
 
         if mode == "train" and texture:
             img = torch.cat([torch.stack([torch.roll(im, (torch.randint(args.im_size[0]*args.canvas_size, (1,)), torch.randint(args.im_size[0]*args.canvas_size, (1,))), (1,2))[:,:args.im_size[0],:args.im_size[1]] for im in img]) for _ in range(args.canvas_samples)])
@@ -329,17 +341,51 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False)
         n_b = lab.shape[0]
 
         output = net(img)
-        loss = criterion(output, lab)
-
-        acc = np.sum(np.equal(np.argmax(output.cpu().data.numpy(), axis=-1), lab.cpu().data.numpy()))
+        if losstype == 'mixup':
+            loss = mixup_criterion(criterion, output, ya, yb, n)
+            _, predicted = torch.max(output.data, 1)
+            acc = (n * predicted.eq(ya.data).cpu().sum().float()
+                        + (1 - n) * predicted.eq(yb.data).cpu().sum().float()).numpy()
+            if mode == 'train':
+                writer.add_scalar('mix_loss', loss, log['gs'])
+                writer.add_scalar('mix_acc', acc, log['gs'])
+        elif losstype == 'smooth':
+            c = LabelSmoothingCrossEntropy()
+            loss = c(output, lab)
+            acc = np.sum(np.equal(np.argmax(output.cpu().data.numpy(), axis=-1), lab.cpu().data.numpy()))
+        else:
+            loss = criterion(output, lab)
+            acc = np.sum(np.equal(np.argmax(output.cpu().data.numpy(), axis=-1), lab.cpu().data.numpy()))
 
         loss_avg += loss.item()*n_b
         acc_avg += acc
         num_exp += n_b
-
         if mode == 'train':
+            log['gs'] += 1
             optimizer.zero_grad()
             loss.backward()
+            if log['gs'] % 100 == 0:
+                if losstype != 'smooth' and isinstance(net, nn.DataParallel):
+                    writer.add_histogram('classifier/weight', net.module.classifier.weight, log['gs'])
+                    writer.add_histogram('grad/classifier/weight', net.module.classifier.weight.grad, log['gs'])
+                    writer.add_histogram('classifier/bias', net.module.classifier.bias, log['gs'])
+                    writer.add_histogram('grad/classifier/bias', net.module.classifier.bias.grad, log['gs'])
+
+                    writer.add_histogram('sparsity/classifier/weight', torch.mean((torch.abs(net.module.classifier.weight) < 1e-5).float()), log['gs'])
+                    writer.add_histogram('sparsity/grad/classifier/weight', torch.mean((torch.abs(net.module.classifier.weight.grad) < 1e-5).float()), log['gs'])
+                    writer.add_histogram('sparsity/classifier/bias', torch.mean((torch.abs(net.module.classifier.bias) < 1e-5).float()), log['gs'])
+                    writer.add_histogram('sparsity/grad/classifier/bias', torch.mean((torch.abs(net.module.classifier.bias.grad) < 1e-5).float()), log['gs'])
+
+                elif losstype != 'smooth':
+                    writer.add_histogram('classifier/weight', net.classifier.weight, log['gs'])
+                    writer.add_histogram('grad/classifier/weight', net.classifier.weight.grad, log['gs'])
+                    writer.add_histogram('classifier/bias', net.classifier.bias, log['gs'])
+                    writer.add_histogram('grad/classifier/bias', net.classifier.bias.grad, log['gs'])
+                    
+                    writer.add_histogram('sparsity/classifier/weight', torch.mean(torch.abs(net.classifier.weight) < 1e-5), log['gs'])
+                    writer.add_histogram('sparsity/grad/classifier/weight', torch.mean(torch.abs(net.classifier.weight.grad) < 1e-5), log['gs'])
+                    writer.add_histogram('sparsity/classifier/bias', torch.mean(torch.abs(net.classifier.bias) < 1e-5), log['gs'])
+                    writer.add_histogram('sparsity/grad/classifier/bias', torch.mean(torch.abs(net.classifier.bias.grad) < 1e-5), log['gs'])
             optimizer.step()
 
     loss_avg /= num_exp
@@ -348,9 +394,13 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False)
     return loss_avg, acc_avg
 
 
-from evaluate import calc_ece
-
-def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, return_loss=False, texture=False, dst_train=None):
+def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args,
+    return_loss=False,
+    texture=False,
+    dst_train=None,
+    losstype='loss',
+    plot=True
+):
     net = net.to(args.device)
     images_train = images_train.to(args.device)
     labels_train = labels_train.to(args.device)
@@ -369,8 +419,12 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, 
     acc_train_list = []
     loss_train_list = []
 
+    # filename = 'runs/fulldata_cifar100_%s' % ( ['before', 'temperature', 'mixup', 'original', 'smooth'][it_eval])
+    filename = 'runs/mask_ipc%d_cifar100_dd_%s' % (args.ipc, ['before', 'temperature', 'mixup', 'original', 'smooth'][it_eval])
+    writer = SummaryWriter(filename)
+    log = {'writer': writer, 'gs': 0}
     for ep in tqdm.tqdm(range(Epoch+1)):
-        loss_train, acc_train = epoch('train', trainloader, net, optimizer, criterion, args, aug=True, texture=texture)
+        loss_train, acc_train = epoch('train', trainloader, net, optimizer, criterion, args, aug=True, texture=texture, losstype=losstype, log=log)
         acc_train_list.append(acc_train)
         loss_train_list.append(loss_train)
         if ep == Epoch:
@@ -383,16 +437,17 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, 
 
     time_train = time.time() - start
 
-    print('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f' % (get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test))
+    print('%s Evaluate_%02d: epoch = %04d train acc = %.4f, test acc = %.4f train time = %d s train loss = %.6f ' % (get_time(), it_eval, Epoch, acc_train, acc_test, int(time_train), loss_train))
 
     ece = calc_ece(
         net,
         testloader,
         global_step=0,
-        epoch=it_eval,
         device=args.device,
         is_test_set=True,
         is_train_set=False,
+        plot=plot,
+        filename = 'mask_ipc_%d_cifar100_dd_%s' % (args.ipc, ['before', 'temperature', 'mixup', 'original', 'smooth'][it_eval])
     )
 
     if return_loss:

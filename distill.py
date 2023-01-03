@@ -1,16 +1,24 @@
 import os
 import argparse
 import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.utils
+
+np.random.seed(0)
+torch.manual_seed(0)
+
 from tqdm import tqdm
 from utils import get_dataset, get_network, get_eval_pool, evaluate_synset, get_time, DiffAugment, ParamDiffAug
 import wandb
 import copy
-import random
+random = np.random
 from reparam_module import ReparamModule
+
+from evaluate import calc_ece
+
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -31,7 +39,7 @@ def main(args):
     args.dsa = True if args.dsa == 'True' else False
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    eval_it_pool = np.arange(0, args.Iteration + 1, args.eval_it).tolist()
+    eval_it_pool = np.arange(0, args.Iteration + 1, args.eval_it).tolist()[1:]
     channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader, loader_train_dict, class_map, class_map_inv = get_dataset(args.dataset, args.data_path, args.batch_real, args.subset, args=args)
     model_eval_pool = get_eval_pool(args.eval_mode, args.model, args.model)
 
@@ -61,6 +69,7 @@ def main(args):
                project="DatasetDistillation",
                job_type="CleanRepo",
                config=args,
+               mode='offline'
                )
 
     args = type('', (), {})()
@@ -150,6 +159,8 @@ def main(args):
     expert_dir = os.path.join(expert_dir, args.model)
     print("Expert Dir: {}".format(expert_dir))
 
+    use_old = 1
+
     if args.load_all:
         buffer = []
         n = 0
@@ -165,45 +176,80 @@ def main(args):
         while os.path.exists(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n))):
             expert_files.append(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n)))
             n += 1
-        '''
-        if n == 0:
-            raise AssertionError("No buffers detected at {}".format(expert_dir))
-        file_idx = 0
-        expert_idx = 0
-        random.shuffle(expert_files)
-        if args.max_files is not None:
-            expert_files = expert_files[:args.max_files]
-        print("loading file {}".format(expert_files[file_idx]))
-        buffer = torch.load(expert_files[file_idx])
-        if args.max_experts is not None:
-            buffer = buffer[:args.max_experts]
-        random.shuffle(buffer)
-        '''
+        if not use_old:
+            if n == 0:
+                raise AssertionError("No buffers detected at {}".format(expert_dir))
+            file_idx = 0
+            expert_idx = 0
+            random.shuffle(expert_files)
+            if args.max_files is not None:
+                expert_files = expert_files[:args.max_files]
+            print("loading file {}".format(expert_files[file_idx]))
+            buffer = torch.load(expert_files[file_idx])
+            if args.max_experts is not None:
+                buffer = buffer[:args.max_experts]
+            random.shuffle(buffer)
 
     best_acc = {m: 0 for m in model_eval_pool}
 
     best_std = {m: 0 for m in model_eval_pool}
 
-    T = len(dst_train)
-    indices = np.arange(T)
-    np.random.shuffle(indices)
-    T = num_classes * args.ipc
-    dst_train, dst_valid = [dst_train[d] for d in indices[: T]], [
-        dst_train[d] for d in indices[T:]]
-    valid_loader = torch.utils.data.DataLoader(
-        dst_valid, batch_size=args.batch_train, shuffle=True, num_workers=0)
 
+    dd_val_loader = None
+    if use_old:
+        indices = np.arange(len(dst_train))
+        np.random.shuffle(indices)
+        slice = True
+        if slice:
+            T = num_classes * args.ipc
+            dst_train0 = [dst_train[d] for d in indices[ : T]]
+            dst_train, dst_valid = dst_train0[: int(T * 0.9)], dst_train0[int(T * 0.9):]
+        else:
+            T = len(dst_train)
+            dst_train0 = list(dst_train)
+            dst_train, dst_valid = dst_train0[: int(T * 0.9)], dst_train0[int(T * 0.9):]
+        valid_loader = torch.utils.data.DataLoader(dst_valid, batch_size=args.batch_train, shuffle=True, num_workers=0)
 
-    x = torch.load('images_best_%s_%s%s.pt' % (args.dataset.lower(), args.ipc, '_z' if args.zca else ''))
-    y = torch.load('labels_best_%s_%s%s.pt' % (args.dataset.lower(), args.ipc, '_z' if args.zca else ''))
-    print('load:', x.shape, num_classes * args.ipc)
+        x0 = torch.load('images_best_%s_%s%s.pt' % (args.dataset.lower(), args.ipc, '_z' if args.zca else ''))
+        y0 = torch.load('labels_best_%s_%s%s.pt' % (args.dataset.lower(), args.ipc, '_z' if args.zca else ''))
+        C = x0.shape[0] // args.ipc
+        train_indices, val_indices = [], []
+        I = np.arange(x0.shape[0])
+        for c in range(C):
+            class_indices = I[y0 == c]
+            assert args.ipc == len(class_indices), '? %s' % class_indices.shape
+            np.random.shuffle(class_indices)
+            T = int(class_indices.shape[0] * 0.9)
+            train_indices.extend(class_indices[: T])
+            val_indices.extend(class_indices[T: ])
+        x_train, x_val = x0[train_indices], x0[val_indices]
+        y_train, y_val = y0[train_indices], y0[val_indices]
+        '''
+        # random split; below is per class split
+        indices = np.arange(x0.shape[0])
+        np.random.shuffle(indices)
+        indices = torch.tensor(indices)
+        T = int(x0.shape[0] * 0.9)
+        x_train, x_val = x0[: T], x0[T: ]
+        y_train, y_val = y0[: T], y0[T: ]
+        '''
+        from utils import TensorDataset
+        
+        dd_original_data = TensorDataset(x0, y0)
+        dd_original_loader = torch.utils.data.DataLoader(dd_original_data, batch_size=args.batch_train, shuffle=True, num_workers=0)
+        
+        dd_dst_train = TensorDataset(x_train, y_train)
+        dd_train_loader = torch.utils.data.DataLoader(dd_dst_train, batch_size=args.batch_train, shuffle=False, num_workers=0)
+        dd_dst_val = TensorDataset(x_val, y_val)
+        dd_val_loader = torch.utils.data.DataLoader(dd_dst_val, batch_size=args.batch_train, shuffle=False, num_workers=0)
+
     for it in range(0, args.Iteration+1):
         save_this_it = False
 
         # writer.add_scalar('Progress', it, it)
         wandb.log({"Progress": it}, step=it)
         ''' Evaluate synthetic data '''
-        if True or it in eval_it_pool:
+        if use_old or it in eval_it_pool:
             for model_eval in model_eval_pool:
                 print('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, iteration = %d'%(args.model, model_eval, it))
                 if args.dsa:
@@ -215,20 +261,54 @@ def main(args):
                 accs_test = []
                 accs_train = []
                 eces = []
+                torch.manual_seed(0)
                 for it_eval in range(args.num_eval):
+                    args.lr_net = syn_lr.item()
+                    FD = 1
+                    test_mixup = 0
+                    test_dd_acc = 0
+                    test_smooth = 0
+                    test_temp = 1
+
                     net_eval = get_network(model_eval, channel, num_classes, im_size).to(args.device) # get a random model
 
                     eval_labs = label_syn
                     with torch.no_grad():
                         image_save = image_syn
                     image_syn_eval, label_syn_eval = copy.deepcopy(image_save.detach()), copy.deepcopy(eval_labs.detach()) # avoid any unaware modification
+                    if use_old:
+                        if test_smooth:
+                            image_syn_eval.data = copy.deepcopy(x0)
+                            label_syn_eval.data = copy.deepcopy(y0)
 
-                    image_syn_eval.data = copy.deepcopy(x)
-                    label_syn_eval.data = copy.deepcopy(y)
+                            smoothnet = copy.deepcopy(net_eval)
+                            print('smooth ece:')
+                            _, acc_train, acc_test, ece = evaluate_synset(it_eval+4, smoothnet, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train0 if FD else None, losstype='smooth')
 
-                    args.lr_net = syn_lr.item()
-                    FD = False
-                    _, acc_train, acc_test, ece = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train if FD else None)
+                        if test_mixup:
+                            image_syn_eval.data = copy.deepcopy(x0)
+                            label_syn_eval.data = copy.deepcopy(y0)
+
+                            mixupnet = copy.deepcopy(net_eval)
+                            print('mixup ece:', args.lr_net)
+                            _, acc_train, acc_test, ece = evaluate_synset(it_eval+2, mixupnet, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train0 if FD else None, losstype='mixup')
+
+                        if test_dd_acc:
+                            image_syn_eval.data = copy.deepcopy(x0)
+                            label_syn_eval.data = copy.deepcopy(y0)
+
+                            original = copy.deepcopy(net_eval)
+                            print('original:')
+                            _, acc_train, acc_test, ece = evaluate_synset(it_eval+3, original, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train0 if FD else None)
+                        image_syn_eval.data = copy.deepcopy(x_train)
+                        label_syn_eval.data = copy.deepcopy(y_train)
+                    if not test_temp:
+                        exit()
+                    print('before temp ece:')
+                    _, acc_train, acc_test, ece = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dd_original_data)
+                    # _, acc_train, acc_test, ece = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dd_dst_train)
+                    # _, acc_train, acc_test, ece = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train if FD else None)
+
                     eces.append(ece)
                     accs_test.append(acc_test)
                     accs_train.append(acc_train)
@@ -246,27 +326,88 @@ def main(args):
                 wandb.log({'Std/{}'.format(model_eval): acc_test_std}, step=it)
                 wandb.log({'Max_Std/{}'.format(model_eval): best_std[model_eval]}, step=it)
                 print('avg ece: %.4f' % np.mean(eces))
-                from temperature import ModelWithTemperature
-                from evaluate import calc_ece
-                model = ModelWithTemperature(net_eval)
-                model.set_temperature(valid_loader)
+                # '''
+                if use_old:
+                    before = copy.deepcopy(net_eval)
+                    from temperature import ModelWithTemperature
+                    model = ModelWithTemperature(before)
+                    if FD:
+                        model.set_temperature(valid_loader if FD else dd_val_loader)
+                        print('FD temperature ece:')
+                        ece = calc_ece(
+                            model,
+                            testloader,
+                            global_step=0,
+                            epoch=it_eval+1,
+                            device=args.device,
+                            is_test_set=True,
+                            is_train_set=False,
+                            ipc=args.ipc
+                        )
+                    else:
+                        all_t = np.linspace(0.1, 0.9, 9)
+                        for vl, name in zip([dd_original_loader, dd_val_loader], ['full', 'split']):
+                            all_ece = []
+                            for t in all_t:
+                                model.set_temperature(vl, t, mute=True)
+                                ece = calc_ece(
+                                    model,
+                                    testloader,
+                                    global_step=0,
+                                    device=args.device,
+                                    is_test_set=True,
+                                    is_train_set=False,
+                                    plot=False
+                                )
+                                print('mask ratio: %.2f temperature ece:' % t, ece)
+                                all_ece.append(ece)
 
-                ece = calc_ece(
-                    model,
-                    testloader,
-                    global_step=0,
-                    epoch=it_eval+1,
-                    device=args.device,
-                    is_test_set=True,
-                    is_train_set=False,
-                )                
-        exit()
+                            model.set_temperature(vl, mute=True)
+                            raw_ece = calc_ece(
+                                model,
+                                testloader,
+                                global_step=0,
+                                device=args.device,
+                                is_test_set=True,
+                                is_train_set=False,
+                                plot=False
+                            )
+
+                            filename = name + ' mask perc'
+                            import matplotlib.pyplot as plt
+                            f = plt.figure(filename, figsize=(6,4))
+                            plt.clf()
+                            plt.plot(all_t, np.ones_like(all_t) * np.array(eces[-1]), label='uncalibrated', color='#f55d5d')
+                            plt.plot(all_t, np.ones_like(all_t) * np.array(raw_ece), label='temperature scaling', color='#5d76f5')
+                            plt.plot(all_t, all_ece, label='masked temperature scaling', color='#a8f55d')
+                            plt.legend()
+                            plt.xlabel('mask percentage')
+                            plt.ylabel('ece')
+                            plt.title(f'mask (%) vs ece on distilled dataset')
+                            plt.savefig(filename.replace(' ', '_'))
+                            plt.close(filename)
+                            
+                            model.set_temperature(vl, all_t[np.argmin(all_ece)])
+                            ece = calc_ece(
+                                model,
+                                testloader,
+                                global_step=0,
+                                device=args.device,
+                                is_test_set=True,
+                                is_train_set=False,
+                                plot=True,
+                                filename = 'mask_ipc_%d_cifar100_dd_mts_%s_validloader' % (args.ipc, name)
+                            )
+
+        if use_old:
+            exit()
+                # '''
 
         if it in eval_it_pool and (save_this_it or it % 1000 == 0):
             with torch.no_grad():
                 image_save = image_syn.cuda()
 
-                save_dir = os.path.join(".", "logged_files", args.dataset, wandb.run.name)
+                save_dir = os.path.join(".", "logged_files", args.dataset, wandb.run.name if wandb.run.name is not None else '_t0')
 
                 if not os.path.exists(save_dir):
                     os.makedirs(save_dir)

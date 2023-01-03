@@ -3,40 +3,80 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-
+import numpy.ma as ma
 
 def plot_avg_conf_acc():
     pass
 
 
-def plot_gap(acc, probs, bins, epoch):
-    filename = 'ipc50_gap_%d'%epoch
+def plot_gap(acc, probs, sizes, bins, ece, actual_acc, is_train=False, filename=''):
     f = plt.figure(filename, figsize=(8,8))
     plt.clf()
-    plt.bar(
-        bins,
-        probs,
-        width=0.1,
-        color='red',
-        edgecolor='r',
-        alpha=0.5,
-        align='edge',
-        label='probs',
-        tick_label=['%.1f'%b for b in bins]
-    )
+    m1 = ma.where(probs > acc)
+    m2 = ma.where(acc > probs)
+    m3 = ma.where(acc == probs)
+    red = {
+        'width': 0.1,
+        'color': '#f55d5d',
+        'edgecolor': 'r',
+        'align': 'edge',
+    }
+    if m1[0].shape[0] > 0:
+        plt.bar(
+            bins[m1],
+            probs[m1],
+            label='bin confidence',
+            **red,
+        )
+    blue = {
+        'width': 0.1,
+        'color': '#5d76f5',
+        'edgecolor': 'b',
+        'align': 'edge',
+    }
     plt.bar(
         bins,
         acc,
-        width=0.1,
-        color=np.array([60, 60, 255]) / 255,
-        edgecolor='b',
-        alpha=0.8,
-        align='edge',
-        label='acc',
-        tick_label=['%.1f'%b for b in bins]
+        label='bin accuracy',
+        tick_label=['%.1f'%b for b in bins],
+        **blue
     )
+    if m2[0].shape[0] > 0:
+        plt.bar(
+            bins[m2],
+            probs[m2],
+            label='bin confidence' if m1[0].shape[0] == 0 else None,
+            **red,
+        )
+    purple = {
+        'width': 0.1,
+        'color': '#775df5',
+        'edgecolor': 'purple',
+        'align': 'edge',
+    }
+    if m3[0].shape[0] > 0:
+        plt.bar(
+            bins[m3],
+            probs[m3],
+            label='conf == acc',
+            **purple,
+        )
+    green = {
+        'width': 0.02,
+        'color': '#a8f55d',
+        'edgecolor': 'g',
+        'align': 'edge',
+    }
+    plt.bar(
+        bins + 0.05,
+        sizes / sizes.sum(),
+        label=f'% of samples',
+        **green
+    )
+    plt.legend()
     plt.xlabel('confidence')
-    plt.ylabel('accuracy')
+    plt.ylabel('percentage')
+    plt.title('ece %.4f' % ece + ' acc %.4f' % actual_acc)
     plt.savefig(filename)
     plt.close(filename)
 
@@ -45,17 +85,18 @@ def calc_ece(
     model,
     loader,
     global_step: int,
-    epoch: int,
     device: torch.device,
     is_test_set: bool = False,
     is_train_set: bool = False,
+    plot=False,
+    filename=''
 ):
     model.eval()
 
     loss = 0
     correct = 0
     n = 0
-    pbar = tqdm(total=len(loader), dynamic_ncols=True)
+    # pbar = tqdm(total=len(loader), dynamic_ncols=True)
     with torch.no_grad():
         idx = 0
         for data, target in loader:
@@ -78,7 +119,7 @@ def calc_ece(
                 preds_list = np.concatenate((preds_list, preds), axis=0)
                 y_true = np.concatenate((y_true, target.cpu().numpy()), axis=0)
 
-            pbar.update(1)
+            # pbar.update(1)
 
             idx += 1
 
@@ -103,23 +144,23 @@ def calc_ece(
             g = 9
         idx_list[g].append(idx)
 
-    acc_list = []; conf_list = []; size_list = []
+    acc_list = np.zeros(len(idx_list))
+    conf_list = np.zeros(len(idx_list))
+    size_list = np.zeros(len(idx_list))
+    actual_acc = 0
     for i in range(len(idx_list)):
         if len(idx_list[i]) == 0:
             acc = 0
             conf = 0
         else:
             acc = sum(y_true[idx_list[i]] == np.reshape(preds_list[idx_list[i]], (-1))) / len(idx_list[i])
+            actual_acc += acc * len(idx_list[i])
             conf = np.mean(probs_max_list[idx_list[i]])
 
-        acc_list.append(acc)
-        conf_list.append(conf)
-        size_list.append(len(idx_list[i]))            
+        acc_list[i] = acc
+        conf_list[i] = conf
+        size_list[i] = len(idx_list[i])
 
-    print(acc_list)
-    print(conf_list)
-    print(size_list)
-    print(len(acc_list), len(conf_list), bins.shape, )
     n = sum(size_list)
     ece = 0
     for i in range(len(acc_list)):
@@ -127,7 +168,11 @@ def calc_ece(
     print('ece:', ece, 'len probs_max_list:', len(probs_max_list))
 
     bins = np.linspace(0, 0.9, 10)
-    # plt.xlabel('confidence p(x)')
-    plot_gap(acc_list, conf_list, bins, epoch=epoch)
+    if plot:
+        plot_gap(acc_list, conf_list, size_list, bins, 
+                 ece=ece, 
+                 actual_acc=actual_acc / n, 
+                 is_train=is_train_set,
+                 filename=filename)
 
     return ece
