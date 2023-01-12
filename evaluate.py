@@ -8,19 +8,37 @@ import numpy.ma as ma
 def plot_avg_conf_acc():
     pass
 
-
+red = {
+    'width': 0.1,
+    'color': '#f55d5d',
+    'edgecolor': 'r',
+    'align': 'edge',
+}
+blue = {
+    'width': 0.1,
+    'color': '#5d76f5',
+    'edgecolor': 'b',
+    'align': 'edge',
+}
+purple = {
+    'width': 0.1,
+    'color': '#775df5',
+    'edgecolor': 'purple',
+    'align': 'edge',
+}
+green = {
+    'width': 0.02,
+    'color': '#a8f55d',
+    'edgecolor': 'g',
+    'align': 'edge',
+}
 def plot_gap(acc, probs, sizes, bins, ece, actual_acc, is_train=False, filename=''):
     f = plt.figure(filename, figsize=(8,8))
     plt.clf()
     m1 = ma.where(probs > acc)
     m2 = ma.where(acc > probs)
     m3 = ma.where(acc == probs)
-    red = {
-        'width': 0.1,
-        'color': '#f55d5d',
-        'edgecolor': 'r',
-        'align': 'edge',
-    }
+
     if m1[0].shape[0] > 0:
         plt.bar(
             bins[m1],
@@ -28,12 +46,6 @@ def plot_gap(acc, probs, sizes, bins, ece, actual_acc, is_train=False, filename=
             label='bin confidence',
             **red,
         )
-    blue = {
-        'width': 0.1,
-        'color': '#5d76f5',
-        'edgecolor': 'b',
-        'align': 'edge',
-    }
     plt.bar(
         bins,
         acc,
@@ -48,12 +60,6 @@ def plot_gap(acc, probs, sizes, bins, ece, actual_acc, is_train=False, filename=
             label='bin confidence' if m1[0].shape[0] == 0 else None,
             **red,
         )
-    purple = {
-        'width': 0.1,
-        'color': '#775df5',
-        'edgecolor': 'purple',
-        'align': 'edge',
-    }
     if m3[0].shape[0] > 0:
         plt.bar(
             bins[m3],
@@ -61,12 +67,6 @@ def plot_gap(acc, probs, sizes, bins, ece, actual_acc, is_train=False, filename=
             label='conf == acc',
             **purple,
         )
-    green = {
-        'width': 0.02,
-        'color': '#a8f55d',
-        'edgecolor': 'g',
-        'align': 'edge',
-    }
     plt.bar(
         bins + 0.05,
         sizes / sizes.sum(),
@@ -176,3 +176,38 @@ def calc_ece(
                  filename=filename)
 
     return ece
+
+
+def plot_max_logit(
+    model,
+    trainloader,
+    filename='',
+    device='cuda'
+):
+    logits = []
+    with torch.no_grad():
+        idx = 0
+        for data, target in trainloader:
+            data, target = data.to(device), target.to(device)
+            output = model(data).cpu().numpy()
+            logits.append(output)
+    logits = np.concatenate(logits, axis=0)
+    print('all logits:', logits.shape)
+    logits = np.max(logits, axis=-1)
+
+    f = plt.figure(filename, figsize=(8,8))
+    plt.clf()
+    plt.hist(
+        logits,
+        density=True,
+        bins=max(logits.shape[0] // 100, 50),
+        color='#5555aa',
+        edgecolor='b',
+        range=(0, 30)
+    )
+    plt.legend()
+    plt.xlabel('logit value')
+    plt.ylabel('percentage')
+    plt.title('histogram of maximum logits ' + filename)
+    plt.savefig(filename)
+    plt.close(filename)

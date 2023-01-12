@@ -116,6 +116,8 @@ def get_dataset(dataset, data_path, batch_size=1, subset="imagenette", args=None
 
 
     elif dataset.startswith('CIFAR100'):
+        config.img_net_classes = config.dict[subset]
+
         channel = 3
         im_size = (32, 32)
         num_classes = 100
@@ -339,7 +341,6 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False,
             lab = torch.tensor([class_map[x.item()] for x in lab]).to(args.device)
 
         n_b = lab.shape[0]
-
         output = net(img)
         if losstype == 'mixup':
             loss = mixup_criterion(criterion, output, ya, yb, n)
@@ -364,7 +365,7 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False,
             log['gs'] += 1
             optimizer.zero_grad()
             loss.backward()
-            if log['gs'] % 100 == 0:
+            if 0 and log['gs'] % 100 == 0:
                 if losstype != 'smooth' and isinstance(net, nn.DataParallel):
                     writer.add_histogram('classifier/weight', net.module.classifier.weight, log['gs'])
                     writer.add_histogram('grad/classifier/weight', net.module.classifier.weight.grad, log['gs'])
@@ -424,6 +425,7 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args,
     writer = SummaryWriter(filename)
     log = {'writer': writer, 'gs': 0}
     for ep in tqdm.tqdm(range(Epoch+1)):
+    # for ep in range(Epoch+1):
         loss_train, acc_train = epoch('train', trainloader, net, optimizer, criterion, args, aug=True, texture=texture, losstype=losstype, log=log)
         acc_train_list.append(acc_train)
         loss_train_list.append(loss_train)
@@ -439,21 +441,10 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args,
 
     print('%s Evaluate_%02d: epoch = %04d train acc = %.4f, test acc = %.4f train time = %d s train loss = %.6f ' % (get_time(), it_eval, Epoch, acc_train, acc_test, int(time_train), loss_train))
 
-    ece = calc_ece(
-        net,
-        testloader,
-        global_step=0,
-        device=args.device,
-        is_test_set=True,
-        is_train_set=False,
-        plot=plot,
-        filename = 'mask_ipc_%d_cifar100_dd_%s' % (args.ipc, ['before', 'temperature', 'mixup', 'original', 'smooth'][it_eval])
-    )
-
     if return_loss:
-        return net, acc_train_list, acc_test, loss_train_list, loss_test, ece
+        return net, acc_train_list, acc_test, loss_train_list, loss_test
     else:
-        return net, acc_train_list, acc_test, ece
+        return net, acc_train_list, acc_test
 
 
 def augment(images, dc_aug_param, device):

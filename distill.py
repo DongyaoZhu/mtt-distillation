@@ -17,7 +17,7 @@ import copy
 random = np.random
 from reparam_module import ReparamModule
 
-from evaluate import calc_ece
+from evaluate import calc_ece, plot_max_logit
 
 
 import warnings
@@ -44,7 +44,6 @@ def main(args):
     model_eval_pool = get_eval_pool(args.eval_mode, args.model, args.model)
 
     im_res = im_size[0]
-
     args.im_size = im_size
 
     accs_all_exps = dict() # record performances of all experiments
@@ -199,7 +198,7 @@ def main(args):
     if use_old:
         indices = np.arange(len(dst_train))
         np.random.shuffle(indices)
-        slice = True
+        slice = False
         if slice:
             T = num_classes * args.ipc
             dst_train0 = [dst_train[d] for d in indices[ : T]]
@@ -209,10 +208,13 @@ def main(args):
             dst_train0 = list(dst_train)
             dst_train, dst_valid = dst_train0[: int(T * 0.9)], dst_train0[int(T * 0.9):]
         valid_loader = torch.utils.data.DataLoader(dst_valid, batch_size=args.batch_train, shuffle=True, num_workers=0)
-
-        x0 = torch.load('images_best_%s_%s%s.pt' % (args.dataset.lower(), args.ipc, '_z' if args.zca else ''))
-        y0 = torch.load('labels_best_%s_%s%s.pt' % (args.dataset.lower(), args.ipc, '_z' if args.zca else ''))
+        dataset_name = args.dataset.lower()
+        if dataset_name == 'imagenet':
+            dataset_name = args.subset
+        x0 = torch.load('data/images_best_%s_%s%s.pt' % (dataset_name, args.ipc, '_z' if args.zca else ''))
+        y0 = torch.load('data/labels_best_%s_%s%s.pt' % (dataset_name, args.ipc, '_z' if args.zca else '')).long()
         C = x0.shape[0] // args.ipc
+        print('x0:', x0.shape, 'y0:', y0.shape, 'C:', C)
         train_indices, val_indices = [], []
         I = np.arange(x0.shape[0])
         for c in range(C):
@@ -265,11 +267,12 @@ def main(args):
                 for it_eval in range(args.num_eval):
                     args.lr_net = syn_lr.item()
                     FD = 1
-                    test_mixup = 0
-                    test_dd_acc = 0
+                    test_mixup = 1
+                    test_dd_acc = 1
                     test_smooth = 0
                     test_temp = 1
 
+                    # net_eval = get_network(model_eval, 3, 200, (64, 64)).to(args.device) # get a random model
                     net_eval = get_network(model_eval, channel, num_classes, im_size).to(args.device) # get a random model
 
                     eval_labs = label_syn
@@ -283,7 +286,17 @@ def main(args):
 
                             smoothnet = copy.deepcopy(net_eval)
                             print('smooth ece:')
-                            _, acc_train, acc_test, ece = evaluate_synset(it_eval+4, smoothnet, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train0 if FD else None, losstype='smooth')
+                            _, acc_train, acc_test = evaluate_synset(it_eval+4, smoothnet, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train0 if FD else None, losstype='smooth')
+                            ece = calc_ece(
+                                smoothnet,
+                                testloader,
+                                global_step=0,
+                                device=args.device,
+                                is_test_set=True,
+                                is_train_set=False,
+                                plot=True,
+                                filename = 'mask_ipc_%d_%s_%s_smooth' % (args.ipc, args.dataset.lower(), ['dd', 'FD'][FD])
+                            )
 
                         if test_mixup:
                             image_syn_eval.data = copy.deepcopy(x0)
@@ -291,7 +304,18 @@ def main(args):
 
                             mixupnet = copy.deepcopy(net_eval)
                             print('mixup ece:', args.lr_net)
-                            _, acc_train, acc_test, ece = evaluate_synset(it_eval+2, mixupnet, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train0 if FD else None, losstype='mixup')
+                            _, acc_train, acc_test = evaluate_synset(it_eval+2, mixupnet, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train0 if FD else None, losstype='mixup')
+                            ece = calc_ece(
+                                mixupnet,
+                                testloader,
+                                global_step=0,
+                                device=args.device,
+                                is_test_set=True,
+                                is_train_set=False,
+                                plot=True,
+                                filename = 'mask_ipc_%d_%s_%s_mixup' % (args.ipc, args.dataset.lower(), ['dd', 'FD'][FD])
+                            )
+                            torch.save(mixupnet, 'mixupnet_%s_%s.pt'%('fd' if FD else 'dd', args.dataset.lower()))
 
                         if test_dd_acc:
                             image_syn_eval.data = copy.deepcopy(x0)
@@ -299,15 +323,38 @@ def main(args):
 
                             original = copy.deepcopy(net_eval)
                             print('original:')
-                            _, acc_train, acc_test, ece = evaluate_synset(it_eval+3, original, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train0 if FD else None)
+                            _, acc_train, acc_test = evaluate_synset(it_eval+3, original, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train0 if FD else None)
+                            ece = calc_ece(
+                                original,
+                                testloader,
+                                global_step=0,
+                                device=args.device,
+                                is_test_set=True,
+                                is_train_set=False,
+                                plot=True,
+                                filename = 'mask_ipc_%d_%s_%s_original' % (args.ipc, args.dataset.lower(), ['dd', 'FD'][FD])
+                            )
+                            torch.save(original, 'original_%s_%s.pt'%('fd' if FD else 'dd', args.dataset.lower()))
                         image_syn_eval.data = copy.deepcopy(x_train)
                         label_syn_eval.data = copy.deepcopy(y_train)
                     if not test_temp:
                         exit()
                     print('before temp ece:')
-                    _, acc_train, acc_test, ece = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dd_original_data)
+
+                    # _, acc_train, acc_test, ece = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dd_original_data)
                     # _, acc_train, acc_test, ece = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dd_dst_train)
-                    # _, acc_train, acc_test, ece = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train if FD else None)
+                    _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture, dst_train=dst_train if FD else dd_original_data)
+                    ece = calc_ece(
+                        net_eval,
+                        testloader,
+                        global_step=0,
+                        device=args.device,
+                        is_test_set=True,
+                        is_train_set=False,
+                        plot=True,
+                        filename = 'mask_ipc_%d_%s_%s_before' % (args.ipc, args.dataset.lower(), ['dd', 'FD'][FD])
+                    )
+                    torch.save(net_eval, 'before_%s_%s.pt'%('fd' if FD else 'dd', args.dataset.lower()))
 
                     eces.append(ece)
                     accs_test.append(acc_test)
@@ -331,39 +378,29 @@ def main(args):
                     before = copy.deepcopy(net_eval)
                     from temperature import ModelWithTemperature
                     model = ModelWithTemperature(before)
-                    if FD:
-                        model.set_temperature(valid_loader if FD else dd_val_loader)
-                        print('FD temperature ece:')
-                        ece = calc_ece(
+
+                    all_t = np.linspace(0.1, 0.9, 9)
+                    for vl, name in zip([dd_original_loader, dd_val_loader], ['full', 'split']):
+                        if FD:
+                            vl = valid_loader
+                            name = 'FD'
+
+                        model.set_temperature(vl, mute=True)
+                        raw_ece = calc_ece(
                             model,
                             testloader,
                             global_step=0,
-                            epoch=it_eval+1,
                             device=args.device,
                             is_test_set=True,
                             is_train_set=False,
-                            ipc=args.ipc
+                            plot=True,
+                            filename = 'mask_ipc_%d_%s_unmasked_%s_validloader' % (args.ipc, args.dataset.lower(), name)
                         )
-                    else:
-                        all_t = np.linspace(0.1, 0.9, 9)
-                        for vl, name in zip([dd_original_loader, dd_val_loader], ['full', 'split']):
-                            all_ece = []
-                            for t in all_t:
-                                model.set_temperature(vl, t, mute=True)
-                                ece = calc_ece(
-                                    model,
-                                    testloader,
-                                    global_step=0,
-                                    device=args.device,
-                                    is_test_set=True,
-                                    is_train_set=False,
-                                    plot=False
-                                )
-                                print('mask ratio: %.2f temperature ece:' % t, ece)
-                                all_ece.append(ece)
 
-                            model.set_temperature(vl, mute=True)
-                            raw_ece = calc_ece(
+                        all_ece = []
+                        for t in all_t:
+                            model.set_temperature(vl, t, mute=True)
+                            ece = calc_ece(
                                 model,
                                 testloader,
                                 global_step=0,
@@ -372,32 +409,37 @@ def main(args):
                                 is_train_set=False,
                                 plot=False
                             )
+                            # print('mask ratio: %.2f temperature ece:' % t, ece)
+                            all_ece.append(ece)
 
-                            filename = name + ' mask perc'
-                            import matplotlib.pyplot as plt
-                            f = plt.figure(filename, figsize=(6,4))
-                            plt.clf()
-                            plt.plot(all_t, np.ones_like(all_t) * np.array(eces[-1]), label='uncalibrated', color='#f55d5d')
-                            plt.plot(all_t, np.ones_like(all_t) * np.array(raw_ece), label='temperature scaling', color='#5d76f5')
-                            plt.plot(all_t, all_ece, label='masked temperature scaling', color='#a8f55d')
-                            plt.legend()
-                            plt.xlabel('mask percentage')
-                            plt.ylabel('ece')
-                            plt.title(f'mask (%) vs ece on distilled dataset')
-                            plt.savefig(filename.replace(' ', '_'))
-                            plt.close(filename)
-                            
-                            model.set_temperature(vl, all_t[np.argmin(all_ece)])
-                            ece = calc_ece(
-                                model,
-                                testloader,
-                                global_step=0,
-                                device=args.device,
-                                is_test_set=True,
-                                is_train_set=False,
-                                plot=True,
-                                filename = 'mask_ipc_%d_cifar100_dd_mts_%s_validloader' % (args.ipc, name)
-                            )
+                        filename = name + ' mask perc'
+                        import matplotlib.pyplot as plt
+                        f = plt.figure(filename, figsize=(6,4))
+                        plt.clf()
+                        plt.plot(all_t, np.ones_like(all_t) * np.array(eces[-1]), label='uncalibrated', color='#f55d5d')
+                        plt.plot(all_t, np.ones_like(all_t) * np.array(raw_ece), label='temperature scaling', color='#5d76f5')
+                        plt.plot(all_t, all_ece, label='masked temperature scaling', color='#a8f55d')
+                        plt.legend()
+                        plt.xlabel('mask percentage')
+                        plt.ylabel('ece')
+                        plt.title(f'mask (%) vs ece on' + ' %s dataset' % (['distilled', 'full'][FD]))
+                        plt.savefig(filename.replace(' ', '_'))
+                        plt.close(filename)
+                        
+                        model.set_temperature(vl, all_t[np.argmin(all_ece)])
+                        ece = calc_ece(
+                            model,
+                            testloader,
+                            global_step=0,
+                            device=args.device,
+                            is_test_set=True,
+                            is_train_set=False,
+                            plot=True,
+                            filename = 'mask_ipc_%d_%s_%s_mts_best_validloader' % (args.ipc, args.dataset.lower(), name)
+                        )
+                        torch.save(model, 'mts_best_%s_%s.pt'%('fd' if FD else 'dd', args.dataset.lower()))
+                        if FD:
+                            break
 
         if use_old:
             exit()
@@ -584,7 +626,7 @@ def main(args):
     wandb.finish()
 
 
-if __name__ == '__main__':
+def parse_args():
     parser = argparse.ArgumentParser(description='Parameter Processing')
 
     parser.add_argument('--dataset', type=str, default='CIFAR10', help='dataset')
@@ -648,7 +690,10 @@ if __name__ == '__main__':
     parser.add_argument('--force_save', action='store_true', help='this will save images for 50ipc')
 
     args = parser.parse_args()
+    return args
 
+if __name__ == '__main__':
+    args = parse_args()
     main(args)
 
 

@@ -15,7 +15,7 @@ class ModelWithTemperature(nn.Module):
         super(ModelWithTemperature, self).__init__()
         self.model = model
         self.init = 1.5
-        self.temperature = nn.Parameter(torch.ones(1) * self.init)
+        self.temperature = nn.Parameter(torch.ones(1, dtype=torch.float32) * 1.5)
 
     def forward(self, input):
         logits = self.model(input)
@@ -36,7 +36,7 @@ class ModelWithTemperature(nn.Module):
         We're going to set it to optimize NLL.
         valid_loader (DataLoader): validation set loader
         """
-        self.temperature = nn.Parameter(torch.ones(1) * self.init)
+        self.temperature = nn.Parameter(torch.ones(1, dtype=torch.float32) * 1.5)
         self.cuda()
         nll_criterion = nn.CrossEntropyLoss().cuda()
         ece_criterion = _ECELoss().cuda()
